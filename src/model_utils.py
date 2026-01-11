@@ -297,11 +297,21 @@ class PromptEngineeringModel:
         return InternalsOutput(hidden_states=hs_dict, attentions=attn_dict, residuals={}, logits=outputs.logits[0, -1].cpu().numpy())
 
     @torch.no_grad()
-    def get_attention_patterns(self, prompt: str, aggregate: str = "last_token") -> Dict:
+    def get_attention_patterns(self, prompt: str, aggregate: str = "last_token", debug: bool = False) -> Dict:
         """Get attention patterns for analysis."""
         internals = self.get_internals(prompt)
         input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids[0]
         tokens = [self.tokenizer.decode([t]) for t in input_ids]
+        
+        # Debug info
+        if debug and internals.attentions:
+            first_layer = list(internals.attentions.keys())[0]
+            attn = internals.attentions[first_layer]
+            print(f"Attention shape: {attn.shape}")
+            print(f"Attention dtype: {attn.dtype}")
+            print(f"Attention min: {attn.min()}, max: {attn.max()}, mean: {attn.mean()}")
+            print(f"Sample attention row sum: {attn[0, -1, :].sum()}")
+        
         results = {"tokens": tokens, "n_layers": len(internals.attentions), "n_heads": internals.attentions[0].shape[0] if internals.attentions else 0, "seq_len": len(tokens)}
         layer_attention = {}
         for layer_idx, attn in internals.attentions.items():
@@ -312,21 +322,34 @@ class PromptEngineeringModel:
             elif aggregate == "max":
                 layer_attention[layer_idx] = attn.max(axis=(0, 1))
         results["layer_attention"] = layer_attention
+        
+        # Calculate entropy properly
         attn_entropy = {}
         for layer_idx, attn in internals.attentions.items():
-            head_entropies = []
-            for head in range(attn.shape[0]):
-                for pos in range(attn.shape[1]):
-                    probs = attn[head, pos, :].copy()
-                    # Ensure valid probability distribution
-                    probs = np.clip(probs, 1e-10, 1.0)
-                    probs = probs / probs.sum()
-                    # Calculate entropy safely
-                    ent = -np.sum(probs * np.log(probs))
-                    if np.isfinite(ent):
-                        head_entropies.append(ent)
-            attn_entropy[layer_idx] = float(np.mean(head_entropies)) if head_entropies else 0.0
+            layer_entropies = []
+            n_heads, seq_len, _ = attn.shape
+            for head in range(n_heads):
+                for pos in range(seq_len):
+                    probs = attn[head, pos, :pos+1].astype(np.float64)  # Only attend to past (causal)
+                    if len(probs) > 0 and probs.sum() > 0:
+                        probs = probs / probs.sum()  # Renormalize
+                        probs = np.clip(probs, 1e-10, 1.0)
+                        ent = -np.sum(probs * np.log(probs))
+                        if np.isfinite(ent) and ent > 0:
+                            layer_entropies.append(ent)
+            attn_entropy[layer_idx] = float(np.mean(layer_entropies)) if layer_entropies else 0.0
         results["attention_entropy"] = attn_entropy
+        
+        # Also add raw stats for debugging
+        results["attention_stats"] = {}
+        for layer_idx, attn in internals.attentions.items():
+            results["attention_stats"][layer_idx] = {
+                "min": float(attn.min()),
+                "max": float(attn.max()),
+                "mean": float(attn.mean()),
+                "shape": list(attn.shape)
+            }
+        
         return results
 
     @torch.no_grad()
