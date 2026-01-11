@@ -29,7 +29,26 @@ class GenerationOutput:
     log_probs: List[float]
     top_k_tokens: List[List[Tuple[str, float]]]  # [(token, prob), ...]
     entropy: List[float]
+
+
+@dataclass
+class InternalsOutput:
+    """Container for model internal states."""
+    hidden_states: Dict[int, np.ndarray]  # layer -> (seq_len, hidden_dim)
+    attentions: Dict[int, np.ndarray]  # layer -> (n_heads, seq_len, seq_len)
+    residuals: Dict[str, np.ndarray]
+    logits: np.ndarray
     
+    def attention_to_token(self, layer: int, head: int, from_pos: int, to_pos: int) -> float:
+        if layer in self.attentions:
+            return float(self.attentions[layer][head, from_pos, to_pos])
+        return 0.0
+    
+    def mean_attention_to_position(self, layer: int, target_pos: int) -> float:
+        if layer in self.attentions:
+            return float(self.attentions[layer][:, :, target_pos].mean())
+        return 0.0
+
 
 class PromptEngineeringModel:
     """Wrapper for LLM with probability extraction capabilities."""
@@ -259,6 +278,92 @@ class PromptEngineeringModel:
             i: hidden_states[i][0].cpu().numpy()
             for i in layer_indices
         }
+
+    @torch.no_grad()
+    def get_internals(self, prompt: str, layers: Optional[List[int]] = None) -> InternalsOutput:
+        """Extract model internals: hidden states and attention patterns."""
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.config.device)
+        outputs = self.model(**inputs, output_hidden_states=True, output_attentions=True)
+        hidden_states = outputs.hidden_states
+        attentions = outputs.attentions
+        if layers is None:
+            layers = list(range(len(hidden_states)))
+        hs_dict, attn_dict = {}, {}
+        for layer_idx in layers:
+            if layer_idx < len(hidden_states):
+                hs_dict[layer_idx] = hidden_states[layer_idx][0].cpu().numpy()
+            if attentions and layer_idx < len(attentions):
+                attn_dict[layer_idx] = attentions[layer_idx][0].cpu().numpy()
+        return InternalsOutput(hidden_states=hs_dict, attentions=attn_dict, residuals={}, logits=outputs.logits[0, -1].cpu().numpy())
+
+    @torch.no_grad()
+    def get_attention_patterns(self, prompt: str, aggregate: str = "last_token") -> Dict:
+        """Get attention patterns for analysis."""
+        internals = self.get_internals(prompt)
+        input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids[0]
+        tokens = [self.tokenizer.decode([t]) for t in input_ids]
+        results = {"tokens": tokens, "n_layers": len(internals.attentions), "n_heads": internals.attentions[0].shape[0] if internals.attentions else 0, "seq_len": len(tokens)}
+        layer_attention = {}
+        for layer_idx, attn in internals.attentions.items():
+            if aggregate == "last_token":
+                layer_attention[layer_idx] = attn[:, -1, :].mean(axis=0)
+            elif aggregate == "mean":
+                layer_attention[layer_idx] = attn.mean(axis=(0, 1))
+            elif aggregate == "max":
+                layer_attention[layer_idx] = attn.max(axis=(0, 1))
+        results["layer_attention"] = layer_attention
+        attn_entropy = {}
+        for layer_idx, attn in internals.attentions.items():
+            head_entropies = []
+            for head in range(attn.shape[0]):
+                for pos in range(attn.shape[1]):
+                    probs = attn[head, pos, :]
+                    probs = probs / (probs.sum() + 1e-10)
+                    ent = -np.sum(probs * np.log(probs + 1e-10))
+                    head_entropies.append(ent)
+            attn_entropy[layer_idx] = np.mean(head_entropies)
+        results["attention_entropy"] = attn_entropy
+        return results
+
+    @torch.no_grad()
+    def compare_internals(self, prompt1: str, prompt2: str, layers: Optional[List[int]] = None) -> Dict:
+        """Compare model internals between two prompts."""
+        int1 = self.get_internals(prompt1, layers)
+        int2 = self.get_internals(prompt2, layers)
+        comparison = {"hidden_state_diff": {}, "attention_diff": {}, "logit_diff": {}}
+        for layer in set(int1.hidden_states.keys()) & set(int2.hidden_states.keys()):
+            hs1, hs2 = int1.hidden_states[layer][-1], int2.hidden_states[layer][-1]
+            comparison["hidden_state_diff"][layer] = {"cosine_sim": float(np.dot(hs1, hs2) / (np.linalg.norm(hs1) * np.linalg.norm(hs2) + 1e-10)), "l2_norm": float(np.linalg.norm(hs1 - hs2)), "mean_abs_diff": float(np.mean(np.abs(hs1 - hs2)))}
+        for layer in set(int1.attentions.keys()) & set(int2.attentions.keys()):
+            attn1, attn2 = int1.attentions[layer], int2.attentions[layer]
+            min_len = min(attn1.shape[-1], attn2.shape[-1])
+            a1, a2 = attn1[:, -1, :min_len].flatten(), attn2[:, -1, :min_len].flatten()
+            comparison["attention_diff"][layer] = {"cosine_sim": float(np.dot(a1, a2) / (np.linalg.norm(a1) * np.linalg.norm(a2) + 1e-10)), "mean_abs_diff": float(np.mean(np.abs(a1 - a2)))}
+        logits1, logits2 = int1.logits, int2.logits
+        comparison["logit_diff"] = {"cosine_sim": float(np.dot(logits1, logits2) / (np.linalg.norm(logits1) * np.linalg.norm(logits2) + 1e-10)), "l2_norm": float(np.linalg.norm(logits1 - logits2)), "top_token_same": int(np.argmax(logits1) == np.argmax(logits2))}
+        return comparison
+
+    @torch.no_grad()
+    def get_head_contributions(self, prompt: str, target_token_idx: int = -1) -> Dict:
+        """Analyze contribution of each attention head."""
+        internals = self.get_internals(prompt)
+        head_importance = {}
+        for layer_idx, attn in internals.attentions.items():
+            n_heads = attn.shape[0]
+            head_stats = []
+            for head in range(n_heads):
+                head_attn = attn[head, target_token_idx, :]
+                probs = head_attn / (head_attn.sum() + 1e-10)
+                entropy = -np.sum(probs * np.log(probs + 1e-10))
+                max_attn_pos = int(np.argmax(head_attn))
+                max_attn_val = float(head_attn.max())
+                head_stats.append({"head": head, "entropy": float(entropy), "max_attention_position": max_attn_pos, "max_attention_value": max_attn_val, "attention_to_start": float(head_attn[0]), "attention_to_self": float(head_attn[target_token_idx]) if target_token_idx >= 0 else 0})
+            head_importance[layer_idx] = head_stats
+        return head_importance
+
+    def get_layer_info(self) -> Dict:
+        """Get information about model layers."""
+        return {"n_layers": self.model.config.num_hidden_layers, "n_heads": self.model.config.num_attention_heads, "hidden_size": self.model.config.hidden_size, "vocab_size": self.model.config.vocab_size, "model_name": self.config.model_name}
 
 
 def load_model(
