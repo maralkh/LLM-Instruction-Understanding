@@ -317,11 +317,15 @@ class PromptEngineeringModel:
             head_entropies = []
             for head in range(attn.shape[0]):
                 for pos in range(attn.shape[1]):
-                    probs = attn[head, pos, :]
-                    probs = probs / (probs.sum() + 1e-10)
-                    ent = -np.sum(probs * np.log(probs + 1e-10))
-                    head_entropies.append(ent)
-            attn_entropy[layer_idx] = np.mean(head_entropies)
+                    probs = attn[head, pos, :].copy()
+                    # Ensure valid probability distribution
+                    probs = np.clip(probs, 1e-10, 1.0)
+                    probs = probs / probs.sum()
+                    # Calculate entropy safely
+                    ent = -np.sum(probs * np.log(probs))
+                    if np.isfinite(ent):
+                        head_entropies.append(ent)
+            attn_entropy[layer_idx] = float(np.mean(head_entropies)) if head_entropies else 0.0
         results["attention_entropy"] = attn_entropy
         return results
 
@@ -352,9 +356,13 @@ class PromptEngineeringModel:
             n_heads = attn.shape[0]
             head_stats = []
             for head in range(n_heads):
-                head_attn = attn[head, target_token_idx, :]
-                probs = head_attn / (head_attn.sum() + 1e-10)
-                entropy = -np.sum(probs * np.log(probs + 1e-10))
+                head_attn = attn[head, target_token_idx, :].copy()
+                # Ensure valid probability distribution
+                head_attn = np.clip(head_attn, 1e-10, 1.0)
+                probs = head_attn / head_attn.sum()
+                entropy = -np.sum(probs * np.log(probs))
+                if not np.isfinite(entropy):
+                    entropy = 0.0
                 max_attn_pos = int(np.argmax(head_attn))
                 max_attn_val = float(head_attn.max())
                 head_stats.append({"head": head, "entropy": float(entropy), "max_attention_position": max_attn_pos, "max_attention_value": max_attn_val, "attention_to_start": float(head_attn[0]), "attention_to_self": float(head_attn[target_token_idx]) if target_token_idx >= 0 else 0})
