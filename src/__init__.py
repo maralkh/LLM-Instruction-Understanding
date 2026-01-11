@@ -45,17 +45,4 @@ from .visualization import (
     create_summary_dashboard
 )
 
-from .test_configs import (
-    TEST_PROMPTS,
-    ALL_TEST_PROMPTS,
-    SYSTEM_PROMPTS,
-    SYSTEM_PROMPTS_CORE,
-    INSTRUCTION_PREFIXES,
-    build_full_prompt,
-    build_chat_prompt,
-    get_test_prompts_flat,
-    get_test_prompts_by_category,
-    get_all_categories
-)
-
 __version__ = "0.1.0"
