@@ -267,6 +267,70 @@ def plot_prompt_strategy_matrix(
     return fig
 
 
+def plot_metric_comparison(
+    metrics: Dict[str, List[float]],
+    labels: List[str] = None,
+    title: str = "Metric Comparison",
+    figsize: Tuple[int, int] = (10, 6)
+) -> plt.Figure:
+    """Compare multiple metrics across conditions."""
+    fig, ax = plt.subplots(figsize=figsize)
+    x = np.arange(len(list(metrics.values())[0]))
+    width = 0.8 / len(metrics)
+    
+    for i, (metric_name, values) in enumerate(metrics.items()):
+        offset = (i - len(metrics)/2 + 0.5) * width
+        ax.bar(x + offset, values, width, label=metric_name, alpha=0.8)
+    
+    if labels:
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=45, ha='right')
+    ax.set_ylabel('Value')
+    ax.set_title(title)
+    ax.legend()
+    plt.tight_layout()
+    return fig
+
+
+def plot_heatmap(
+    data: np.ndarray,
+    row_labels: List[str] = None,
+    col_labels: List[str] = None,
+    title: str = "Heatmap",
+    cmap: str = "RdYlGn",
+    figsize: Tuple[int, int] = (10, 8),
+    annot: bool = True
+) -> plt.Figure:
+    """Create a heatmap visualization."""
+    fig, ax = plt.subplots(figsize=figsize)
+    sns.heatmap(data, annot=annot, fmt='.3f', cmap=cmap, ax=ax,
+                xticklabels=col_labels, yticklabels=row_labels)
+    ax.set_title(title)
+    plt.tight_layout()
+    return fig
+
+
+def plot_layer_analysis(
+    layer_data: Dict[int, float],
+    title: str = "Layer Analysis",
+    ylabel: str = "Value",
+    figsize: Tuple[int, int] = (12, 5)
+) -> plt.Figure:
+    """Plot metrics across model layers."""
+    fig, ax = plt.subplots(figsize=figsize)
+    layers = sorted(layer_data.keys())
+    values = [layer_data[l] for l in layers]
+    
+    ax.plot(layers, values, 'b-o', linewidth=2, markersize=6)
+    ax.fill_between(layers, values, alpha=0.3)
+    ax.set_xlabel('Layer')
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.set_xticks(layers)
+    plt.tight_layout()
+    return fig
+
+
 def create_summary_dashboard(
     results: List[Dict],
     dimensions: List[str],
