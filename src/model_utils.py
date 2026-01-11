@@ -103,25 +103,33 @@ class PromptEngineeringModel:
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.config.device)
         outputs = self.model(**inputs)
         
-        # Get logits for the last position
-        logits = outputs.logits[0, -1, :]
+        # Get logits for the last position - convert to float32 for stability
+        logits = outputs.logits[0, -1, :].float()
         probs = F.softmax(logits, dim=-1)
         
         # Calculate entropy
-        entropy = -torch.sum(probs * torch.log(probs + 1e-10)).item()
+        log_probs = torch.log(probs + 1e-10)
+        entropy = -torch.sum(probs * log_probs).item()
+        if not np.isfinite(entropy):
+            entropy = 0.0
         
         # Get top-k tokens
-        top_probs, top_indices = torch.topk(probs, top_k)
+        top_probs, top_indices = torch.topk(probs, min(top_k, len(probs)))
         top_tokens = [
             (self.tokenizer.decode([idx]), prob.item())
             for idx, prob in zip(top_indices, top_probs)
         ]
         
+        # Convert to float64 numpy for stable metric computation
+        full_probs = probs.cpu().numpy().astype(np.float64)
+        full_probs = np.clip(full_probs, 1e-10, 1.0)
+        full_probs = full_probs / full_probs.sum()  # Renormalize
+        
         return {
             "top_tokens": top_tokens,
             "entropy": entropy,
-            "full_probs": probs.cpu().numpy(),
-            "logits": logits.cpu().numpy()
+            "full_probs": full_probs,
+            "logits": logits.cpu().numpy().astype(np.float64)
         }
     
     @torch.no_grad()
@@ -292,10 +300,13 @@ class PromptEngineeringModel:
         hs_dict, attn_dict = {}, {}
         for layer_idx in layers:
             if layer_idx < len(hidden_states):
-                hs_dict[layer_idx] = hidden_states[layer_idx][0].cpu().numpy()
+                hs_dict[layer_idx] = hidden_states[layer_idx][0].float().cpu().numpy()
             if attentions and layer_idx < len(attentions):
-                attn_dict[layer_idx] = attentions[layer_idx][0].cpu().numpy()
-        return InternalsOutput(hidden_states=hs_dict, attentions=attn_dict, residuals={}, logits=outputs.logits[0, -1].cpu().numpy())
+                attn_dict[layer_idx] = attentions[layer_idx][0].float().cpu().numpy()
+        # Convert logits to float32 and handle inf/nan
+        logits = outputs.logits[0, -1].float().cpu().numpy()
+        logits = np.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
+        return InternalsOutput(hidden_states=hs_dict, attentions=attn_dict, residuals={}, logits=logits)
 
     @torch.no_grad()
     def get_attention_patterns(self, prompt: str, aggregate: str = "last_token", debug: bool = False) -> Dict:
@@ -360,16 +371,54 @@ class PromptEngineeringModel:
         int1 = self.get_internals(prompt1, layers)
         int2 = self.get_internals(prompt2, layers)
         comparison = {"hidden_state_diff": {}, "attention_diff": {}, "logit_diff": {}}
+        
         for layer in set(int1.hidden_states.keys()) & set(int2.hidden_states.keys()):
-            hs1, hs2 = int1.hidden_states[layer][-1], int2.hidden_states[layer][-1]
-            comparison["hidden_state_diff"][layer] = {"cosine_sim": float(np.dot(hs1, hs2) / (np.linalg.norm(hs1) * np.linalg.norm(hs2) + 1e-10)), "l2_norm": float(np.linalg.norm(hs1 - hs2)), "mean_abs_diff": float(np.mean(np.abs(hs1 - hs2)))}
+            hs1 = int1.hidden_states[layer][-1].astype(np.float64)
+            hs2 = int2.hidden_states[layer][-1].astype(np.float64)
+            norm1, norm2 = np.linalg.norm(hs1), np.linalg.norm(hs2)
+            if norm1 > 0 and norm2 > 0:
+                cosine = float(np.dot(hs1, hs2) / (norm1 * norm2))
+            else:
+                cosine = 0.0
+            comparison["hidden_state_diff"][layer] = {
+                "cosine_sim": cosine if np.isfinite(cosine) else 0.0,
+                "l2_norm": float(np.linalg.norm(hs1 - hs2)),
+                "mean_abs_diff": float(np.mean(np.abs(hs1 - hs2)))
+            }
+        
         for layer in set(int1.attentions.keys()) & set(int2.attentions.keys()):
             attn1, attn2 = int1.attentions[layer], int2.attentions[layer]
             min_len = min(attn1.shape[-1], attn2.shape[-1])
-            a1, a2 = attn1[:, -1, :min_len].flatten(), attn2[:, -1, :min_len].flatten()
-            comparison["attention_diff"][layer] = {"cosine_sim": float(np.dot(a1, a2) / (np.linalg.norm(a1) * np.linalg.norm(a2) + 1e-10)), "mean_abs_diff": float(np.mean(np.abs(a1 - a2)))}
-        logits1, logits2 = int1.logits, int2.logits
-        comparison["logit_diff"] = {"cosine_sim": float(np.dot(logits1, logits2) / (np.linalg.norm(logits1) * np.linalg.norm(logits2) + 1e-10)), "l2_norm": float(np.linalg.norm(logits1 - logits2)), "top_token_same": int(np.argmax(logits1) == np.argmax(logits2))}
+            a1 = attn1[:, -1, :min_len].flatten().astype(np.float64)
+            a2 = attn2[:, -1, :min_len].flatten().astype(np.float64)
+            norm1, norm2 = np.linalg.norm(a1), np.linalg.norm(a2)
+            if norm1 > 0 and norm2 > 0:
+                cosine = float(np.dot(a1, a2) / (norm1 * norm2))
+            else:
+                cosine = 0.0
+            comparison["attention_diff"][layer] = {
+                "cosine_sim": cosine if np.isfinite(cosine) else 0.0,
+                "mean_abs_diff": float(np.mean(np.abs(a1 - a2)))
+            }
+        
+        # Handle logits with NaN/Inf protection
+        logits1 = int1.logits.astype(np.float64)
+        logits2 = int2.logits.astype(np.float64)
+        # Replace any inf/nan with 0
+        logits1 = np.nan_to_num(logits1, nan=0.0, posinf=0.0, neginf=0.0)
+        logits2 = np.nan_to_num(logits2, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        norm1, norm2 = np.linalg.norm(logits1), np.linalg.norm(logits2)
+        if norm1 > 0 and norm2 > 0:
+            logit_cosine = float(np.dot(logits1, logits2) / (norm1 * norm2))
+        else:
+            logit_cosine = 0.0
+        
+        comparison["logit_diff"] = {
+            "cosine_sim": logit_cosine if np.isfinite(logit_cosine) else 0.0,
+            "l2_norm": float(np.linalg.norm(logits1 - logits2)),
+            "top_token_same": int(np.argmax(logits1) == np.argmax(logits2))
+        }
         return comparison
 
     @torch.no_grad()
