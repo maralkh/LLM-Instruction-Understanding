@@ -75,6 +75,7 @@ class PromptEngineeringModel:
             "torch_dtype": self.config.torch_dtype,
             "device_map": self.config.device,
             "trust_remote_code": True,
+            "attn_implementation": "eager",  # Required for output_attentions=True
         }
         
         if self.config.load_in_8bit:
@@ -85,7 +86,7 @@ class PromptEngineeringModel:
             **load_kwargs
         )
         self.model.eval()
-        print(f"Model loaded on {self.config.device}")
+        print(f"Model loaded on {self.config.device} with eager attention")
         
     @torch.no_grad()
     def get_next_token_distribution(
@@ -330,13 +331,14 @@ class PromptEngineeringModel:
             n_heads, seq_len, _ = attn.shape
             for head in range(n_heads):
                 for pos in range(seq_len):
-                    probs = attn[head, pos, :pos+1].astype(np.float64)  # Only attend to past (causal)
-                    if len(probs) > 0 and probs.sum() > 0:
-                        probs = probs / probs.sum()  # Renormalize
-                        probs = np.clip(probs, 1e-10, 1.0)
-                        ent = -np.sum(probs * np.log(probs))
-                        if np.isfinite(ent) and ent > 0:
-                            layer_entropies.append(ent)
+                    # Use full row - attention is already softmaxed
+                    probs = attn[head, pos, :].astype(np.float64)
+                    # Clip to avoid log(0)
+                    probs = np.clip(probs, 1e-10, 1.0)
+                    # Calculate entropy: -sum(p * log(p))
+                    ent = -np.sum(probs * np.log(probs))
+                    if np.isfinite(ent):
+                        layer_entropies.append(ent)
             attn_entropy[layer_idx] = float(np.mean(layer_entropies)) if layer_entropies else 0.0
         results["attention_entropy"] = attn_entropy
         
